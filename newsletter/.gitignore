@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+.env
+oauth_token.json
+.newsletter_state.json

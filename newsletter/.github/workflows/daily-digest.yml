@@ -1,0 +1,52 @@
+name: AI Thread - Choi - Daily Digest
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 08:00 Asia/Seoul = 23:00 UTC (previous day)
+    - cron: "0 23 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-digest
+  cancel-in-progress: false
+
+jobs:
+  send_digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run newsletter workflow
+        env:
+          TASK_NAME: choi_threads_newsletter
+          RSS_URL: ${{ secrets.RSS_URL }}
+          TO_EMAIL: ${{ secrets.TO_EMAIL }}
+          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: "gemini-flash-latest"
+          HOURS_BACK: "24"
+          MAX_ITEMS: "20"
+          # Manual run is for testing today; scheduled runs start from 2026-02-19 (Asia/Seoul).
+          START_DATE_LOCAL: ${{ github.event_name == 'schedule' && '2026-02-19' || '' }}
+          LOCAL_TIMEZONE: "Asia/Seoul"
+        run: python newsletter_workflow.py
