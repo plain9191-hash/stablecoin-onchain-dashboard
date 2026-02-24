@@ -7,8 +7,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Stablecoin Onchain Dashboard", page_icon="🪙", layout="wide")
 
-CHAINS_API_URL = "https://stablecoins.llama.fi/stablecoinchains"
-CHAIN_HISTORY_API = "https://stablecoins.llama.fi/stablecoincharts/{chain}"
+STABLECOINS_API_URL = "https://stablecoins.llama.fi/stablecoins?includePrices=true"
 FX_API_URL = "https://api.frankfurter.app/latest?from=USD&to=KRW"
 TARGET_CHAINS = ["Ethereum", "Tron", "BSC", "Solana"]
 DISPLAY_NAME_MAP = {
@@ -17,80 +16,32 @@ DISPLAY_NAME_MAP = {
     "BSC": "BNB (BSC)",
     "Solana": "SOL",
 }
+CHAIN_SCOPE_OPTIONS = ["전체", "ETH", "TRON", "BNB", "SOL"]
+CHAIN_SCOPE_TO_CHAIN = {
+    "전체": None,
+    "ETH": "Ethereum",
+    "TRON": "Tron",
+    "BNB": "BSC",
+    "SOL": "Solana",
+}
+TOKEN_OPTIONS = ["전체", "USDT", "USDC", "DAI", "USDe", "FDUSD", "PYUSD"]
 
 
-def _as_datetime(value: str | int | float | None) -> dt.datetime | None:
-    if value is None:
-        return None
-    try:
-        ts = int(value)
-        if ts > 10_000_000_000:
-            ts = int(ts / 1000)
-        return dt.datetime.utcfromtimestamp(ts)
-    except (TypeError, ValueError, OSError):
-        return None
-
-
-def _extract_pegged_usd(obj: dict | None) -> float | None:
+def _extract_pegged_usd(obj: dict | None) -> float:
     if not isinstance(obj, dict):
-        return None
+        return 0.0
     value = obj.get("peggedUSD")
-    return float(value) if isinstance(value, (int, float)) else None
+    return float(value) if isinstance(value, (int, float)) else 0.0
 
 
 @st.cache_data(ttl=60 * 30)
-def load_chain_supply() -> pd.DataFrame:
-    response = requests.get(CHAINS_API_URL, timeout=30)
+def load_stablecoin_assets() -> tuple[list[dict], str]:
+    response = requests.get(STABLECOINS_API_URL, timeout=30)
     response.raise_for_status()
     payload = response.json()
-
-    records: list[dict] = []
-    for chain in payload:
-        name = chain.get("name")
-        if name not in TARGET_CHAINS:
-            continue
-        market_cap = _extract_pegged_usd(chain.get("totalCirculatingUSD"))
-        records.append(
-            {
-                "chain": name,
-                "display_chain": DISPLAY_NAME_MAP.get(name, name),
-                "market_cap_usd": market_cap,
-            }
-        )
-
-    df = pd.DataFrame(records)
-    if df.empty:
-        return df
-    df = df.dropna(subset=["market_cap_usd"]).sort_values("market_cap_usd", ascending=False)
-    total = df["market_cap_usd"].sum()
-    df["dominance_pct"] = (df["market_cap_usd"] / total * 100) if total else 0.0
-    return df
-
-
-@st.cache_data(ttl=60 * 30)
-def load_daily_change(chain_name: str) -> tuple[float | None, float | None, dt.datetime | None]:
-    response = requests.get(CHAIN_HISTORY_API.format(chain=chain_name), timeout=30)
-    response.raise_for_status()
-    rows = response.json()
-    if not isinstance(rows, list) or len(rows) < 2:
-        return None, None, None
-
-    parsed: list[tuple[dt.datetime, float]] = []
-    for row in rows:
-        ts = _as_datetime(row.get("date"))
-        cap = _extract_pegged_usd(row.get("totalCirculatingUSD"))
-        if ts and cap is not None:
-            parsed.append((ts, cap))
-
-    if len(parsed) < 2:
-        return None, None, None
-
-    parsed.sort(key=lambda x: x[0])
-    latest_ts, latest_val = parsed[-1]
-    prev_val = parsed[-2][1]
-    delta_abs = latest_val - prev_val
-    delta_pct = (delta_abs / prev_val * 100) if prev_val else None
-    return delta_abs, delta_pct, latest_ts
+    assets = payload.get("peggedAssets", []) if isinstance(payload, dict) else []
+    fetched_at = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    return assets, fetched_at
 
 
 @st.cache_data(ttl=60 * 60)
@@ -103,7 +54,48 @@ def load_usd_krw_rate() -> float | None:
     return float(krw) if isinstance(krw, (int, float)) else None
 
 
-def fmt_usd(value: float | None) -> str:
+def build_chain_dataframe(assets: list[dict], token_symbol: str) -> pd.DataFrame:
+    agg = {
+        chain: {
+            "chain": chain,
+            "display_chain": DISPLAY_NAME_MAP.get(chain, chain),
+            "market_cap_usd": 0.0,
+            "prev_day_usd": 0.0,
+        }
+        for chain in TARGET_CHAINS
+    }
+
+    for asset in assets:
+        if asset.get("pegType") != "peggedUSD":
+            continue
+        symbol = asset.get("symbol")
+        if token_symbol != "전체" and symbol != token_symbol:
+            continue
+
+        chain_circulating = asset.get("chainCirculating", {})
+        if not isinstance(chain_circulating, dict):
+            continue
+
+        for chain in TARGET_CHAINS:
+            chain_data = chain_circulating.get(chain, {})
+            if not isinstance(chain_data, dict):
+                continue
+            agg[chain]["market_cap_usd"] += _extract_pegged_usd(chain_data.get("current"))
+            agg[chain]["prev_day_usd"] += _extract_pegged_usd(chain_data.get("circulatingPrevDay"))
+
+    df = pd.DataFrame(list(agg.values()))
+    df["delta_abs_usd"] = df["market_cap_usd"] - df["prev_day_usd"]
+    df["delta_pct"] = df.apply(
+        lambda r: (r["delta_abs_usd"] / r["prev_day_usd"] * 100) if r["prev_day_usd"] else None,
+        axis=1,
+    )
+
+    total = df["market_cap_usd"].sum()
+    df["dominance_pct"] = (df["market_cap_usd"] / total * 100) if total else 0.0
+    return df.sort_values("market_cap_usd", ascending=False)
+
+
+def fmt_usd_compact(value: float | None) -> str:
     if value is None or pd.isna(value):
         return "-"
     if value >= 1_000_000_000:
@@ -132,37 +124,27 @@ def fmt_pct(value: float | None) -> str:
 
 
 st.title("Stablecoin Onchain Dashboard")
-st.caption("Chains: ETH, TRON, BNB (BSC), SOL | Public, no-login dashboard")
+st.caption("Public, no-login dashboard | Chain + stablecoin type filters")
 
 with st.sidebar:
     st.header("Controls")
-    selected = st.multiselect(
-        "Select chains",
-        options=TARGET_CHAINS,
-        default=TARGET_CHAINS,
-        format_func=lambda x: DISPLAY_NAME_MAP.get(x, x),
-    )
+    chain_scope = st.selectbox("Chain scope", CHAIN_SCOPE_OPTIONS, index=0)
+    token_scope = st.selectbox("STC type", TOKEN_OPTIONS, index=0)
     st.caption("Source: DefiLlama stablecoin APIs")
 
 try:
-    base_df = load_chain_supply()
+    assets, fetched_at = load_stablecoin_assets()
 except requests.RequestException as exc:
     st.error(f"Failed to load onchain data: {exc}")
     st.stop()
 
-if base_df.empty:
-    st.warning("No chain data found from the API.")
-    st.stop()
+base_df = build_chain_dataframe(assets, token_scope)
+selected_chain = CHAIN_SCOPE_TO_CHAIN[chain_scope]
+view_df = base_df if selected_chain is None else base_df[base_df["chain"] == selected_chain].copy()
 
-view_df = base_df[base_df["chain"].isin(selected)].copy()
 if view_df.empty:
-    st.warning("Please select at least one chain.")
+    st.warning("No data for the selected filter.")
     st.stop()
-
-changes = view_df["chain"].apply(load_daily_change)
-view_df["delta_abs_usd"] = changes.apply(lambda x: x[0])
-view_df["delta_pct"] = changes.apply(lambda x: x[1])
-view_df["last_updated"] = changes.apply(lambda x: x[2])
 
 usd_krw_rate = None
 try:
@@ -170,19 +152,12 @@ try:
 except requests.RequestException:
     usd_krw_rate = None
 
-if usd_krw_rate is not None:
-    view_df["market_cap_krw"] = view_df["market_cap_usd"] * usd_krw_rate
-else:
-    view_df["market_cap_krw"] = None
+view_df["market_cap_krw"] = view_df["market_cap_usd"] * usd_krw_rate if usd_krw_rate else None
 
 col1, col2, col3 = st.columns(3)
-col1.metric("Total Stablecoin Supply", fmt_usd(view_df["market_cap_usd"].sum()))
+col1.metric("Total Stablecoin Supply", fmt_usd_compact(view_df["market_cap_usd"].sum()))
 col2.metric("Top Chain", view_df.iloc[0]["display_chain"])
-latest_update = view_df["last_updated"].dropna()
-col3.metric(
-    "Last Updated (UTC)",
-    latest_update.max().strftime("%Y-%m-%d") if not latest_update.empty else "-",
-)
+col3.metric("Data Fetched (UTC)", fetched_at)
 
 if usd_krw_rate is not None:
     st.caption(f"FX Rate: 1 USD = {usd_krw_rate:,.2f} KRW")
@@ -222,7 +197,6 @@ table_df = view_df[
         "dominance_pct",
         "delta_abs_usd",
         "delta_pct",
-        "last_updated",
     ]
 ].rename(
     columns={
@@ -232,7 +206,6 @@ table_df = view_df[
         "dominance_pct": "Dominance (%)",
         "delta_abs_usd": "Change (1d USD)",
         "delta_pct": "Change (1d %)",
-        "last_updated": "Last Updated (UTC)",
     }
 )
 
@@ -242,8 +215,5 @@ snapshot_df["Supply (KRW)"] = snapshot_df["Supply (KRW)"].map(fmt_krw_full)
 snapshot_df["Change (1d USD)"] = snapshot_df["Change (1d USD)"].map(fmt_usd_full)
 snapshot_df["Dominance (%)"] = snapshot_df["Dominance (%)"].map(fmt_pct)
 snapshot_df["Change (1d %)"] = snapshot_df["Change (1d %)"].map(fmt_pct)
-snapshot_df["Last Updated (UTC)"] = snapshot_df["Last Updated (UTC)"].map(
-    lambda d: d.strftime("%Y-%m-%d") if pd.notna(d) else "-"
-)
 
 st.dataframe(snapshot_df, hide_index=True, use_container_width=True)
