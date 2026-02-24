@@ -1,5 +1,4 @@
 import datetime as dt
-from typing import Dict, List
 
 import pandas as pd
 import plotly.express as px
@@ -8,7 +7,8 @@ import streamlit as st
 
 st.set_page_config(page_title="Stablecoin Onchain Dashboard", page_icon="🪙", layout="wide")
 
-API_URL = "https://stablecoins.llama.fi/stablecoinchains"
+CHAINS_API_URL = "https://stablecoins.llama.fi/stablecoinchains"
+CHAIN_HISTORY_API = "https://stablecoins.llama.fi/stablecoincharts/{chain}"
 TARGET_CHAINS = ["Ethereum", "Tron", "BSC", "Solana"]
 DISPLAY_NAME_MAP = {
     "Ethereum": "ETH",
@@ -18,92 +18,78 @@ DISPLAY_NAME_MAP = {
 }
 
 
-def _as_datetime(value) -> dt.datetime | None:
+def _as_datetime(value: str | int | float | None) -> dt.datetime | None:
     if value is None:
         return None
-    if isinstance(value, (int, float)):
-        try:
-            if value > 10_000_000_000:
-                return dt.datetime.utcfromtimestamp(value / 1000)
-            return dt.datetime.utcfromtimestamp(value)
-        except (ValueError, OSError):
-            return None
-    if isinstance(value, str):
-        try:
-            return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
-        except ValueError:
-            return None
-    return None
+    try:
+        ts = int(value)
+        if ts > 10_000_000_000:
+            ts = int(ts / 1000)
+        return dt.datetime.utcfromtimestamp(ts)
+    except (TypeError, ValueError, OSError):
+        return None
 
 
-def _extract_recent(values) -> Dict[str, float | dt.datetime | None]:
-    if not values:
-        return {"latest": None, "prev": None, "last_updated": None}
-
-    rows: List[tuple[dt.datetime, float]] = []
-    for item in values:
-        if isinstance(item, dict):
-            ts = _as_datetime(item.get("date") or item.get("timestamp") or item.get("time"))
-            cap = item.get("totalCirculatingUSD")
-            if cap is None:
-                cap = item.get("totalCirculating", {}).get("peggedUSD") if isinstance(item.get("totalCirculating"), dict) else None
-            if cap is None:
-                cap = item.get("marketCap")
-            if ts and isinstance(cap, (int, float)):
-                rows.append((ts, float(cap)))
-        elif isinstance(item, (list, tuple)) and len(item) >= 2:
-            ts = _as_datetime(item[0])
-            cap = item[1]
-            if ts and isinstance(cap, (int, float)):
-                rows.append((ts, float(cap)))
-
-    if not rows:
-        return {"latest": None, "prev": None, "last_updated": None}
-
-    rows.sort(key=lambda x: x[0])
-    latest_ts, latest_val = rows[-1]
-    prev_val = rows[-2][1] if len(rows) > 1 else None
-    return {"latest": latest_val, "prev": prev_val, "last_updated": latest_ts}
+def _extract_pegged_usd(obj: dict | None) -> float | None:
+    if not isinstance(obj, dict):
+        return None
+    value = obj.get("peggedUSD")
+    return float(value) if isinstance(value, (int, float)) else None
 
 
 @st.cache_data(ttl=60 * 30)
-def load_chain_data() -> pd.DataFrame:
-    response = requests.get(API_URL, timeout=30)
+def load_chain_supply() -> pd.DataFrame:
+    response = requests.get(CHAINS_API_URL, timeout=30)
     response.raise_for_status()
     payload = response.json()
 
-    chains = payload if isinstance(payload, list) else payload.get("chains", [])
-    records = []
-
-    for chain in chains:
+    records: list[dict] = []
+    for chain in payload:
         name = chain.get("name")
         if name not in TARGET_CHAINS:
             continue
-
-        recent = _extract_recent(chain.get("chainBalances") or chain.get("history") or chain.get("marketCaps") or [])
-
-        latest = recent["latest"]
-        prev = recent["prev"]
-        delta_abs = (latest - prev) if (latest is not None and prev is not None) else None
-        delta_pct = ((latest - prev) / prev * 100) if (latest is not None and prev and prev != 0) else None
-
+        market_cap = _extract_pegged_usd(chain.get("totalCirculatingUSD"))
         records.append(
             {
                 "chain": name,
                 "display_chain": DISPLAY_NAME_MAP.get(name, name),
-                "market_cap_usd": latest,
-                "delta_abs_usd": delta_abs,
-                "delta_pct": delta_pct,
-                "last_updated": recent["last_updated"],
+                "market_cap_usd": market_cap,
             }
         )
 
     df = pd.DataFrame(records)
-    if not df.empty:
-        df = df.sort_values("market_cap_usd", ascending=False)
-        total = df["market_cap_usd"].sum()
-        df["dominance_pct"] = (df["market_cap_usd"] / total * 100) if total else 0.0
+    if df.empty:
+        return df
+    df = df.dropna(subset=["market_cap_usd"]).sort_values("market_cap_usd", ascending=False)
+    total = df["market_cap_usd"].sum()
+    df["dominance_pct"] = (df["market_cap_usd"] / total * 100) if total else 0.0
     return df
+
+
+@st.cache_data(ttl=60 * 30)
+def load_daily_change(chain_name: str) -> tuple[float | None, float | None, dt.datetime | None]:
+    response = requests.get(CHAIN_HISTORY_API.format(chain=chain_name), timeout=30)
+    response.raise_for_status()
+    rows = response.json()
+    if not isinstance(rows, list) or len(rows) < 2:
+        return None, None, None
+
+    parsed: list[tuple[dt.datetime, float]] = []
+    for row in rows:
+        ts = _as_datetime(row.get("date"))
+        cap = _extract_pegged_usd(row.get("totalCirculatingUSD"))
+        if ts and cap is not None:
+            parsed.append((ts, cap))
+
+    if len(parsed) < 2:
+        return None, None, None
+
+    parsed.sort(key=lambda x: x[0])
+    latest_ts, latest_val = parsed[-1]
+    prev_val = parsed[-2][1]
+    delta_abs = latest_val - prev_val
+    delta_pct = (delta_abs / prev_val * 100) if prev_val else None
+    return delta_abs, delta_pct, latest_ts
 
 
 def fmt_usd(value: float | None) -> str:
@@ -127,10 +113,10 @@ with st.sidebar:
         default=TARGET_CHAINS,
         format_func=lambda x: DISPLAY_NAME_MAP.get(x, x),
     )
-    st.caption("Data source: DefiLlama stablecoinchains API")
+    st.caption("Source: DefiLlama stablecoin APIs")
 
 try:
-    base_df = load_chain_data()
+    base_df = load_chain_supply()
 except requests.RequestException as exc:
     st.error(f"Failed to load onchain data: {exc}")
     st.stop()
@@ -144,13 +130,18 @@ if view_df.empty:
     st.warning("Please select at least one chain.")
     st.stop()
 
+changes = view_df["chain"].apply(load_daily_change)
+view_df["delta_abs_usd"] = changes.apply(lambda x: x[0])
+view_df["delta_pct"] = changes.apply(lambda x: x[1])
+view_df["last_updated"] = changes.apply(lambda x: x[2])
+
 col1, col2, col3 = st.columns(3)
 col1.metric("Total Stablecoin Supply", fmt_usd(view_df["market_cap_usd"].sum()))
 col2.metric("Top Chain", view_df.iloc[0]["display_chain"])
 latest_update = view_df["last_updated"].dropna()
 col3.metric(
     "Last Updated (UTC)",
-    latest_update.max().strftime("%Y-%m-%d %H:%M") if not latest_update.empty else "-",
+    latest_update.max().strftime("%Y-%m-%d") if not latest_update.empty else "-",
 )
 
 chart_col1, chart_col2 = st.columns(2)
@@ -185,8 +176,8 @@ table_df = view_df[
         "display_chain": "Chain",
         "market_cap_usd": "Supply (USD)",
         "dominance_pct": "Dominance (%)",
-        "delta_abs_usd": "Change (USD)",
-        "delta_pct": "Change (%)",
+        "delta_abs_usd": "Change (1d USD)",
+        "delta_pct": "Change (1d %)",
         "last_updated": "Last Updated (UTC)",
     }
 )
@@ -198,8 +189,8 @@ st.dataframe(
     column_config={
         "Supply (USD)": st.column_config.NumberColumn(format="$%.0f"),
         "Dominance (%)": st.column_config.NumberColumn(format="%.2f"),
-        "Change (USD)": st.column_config.NumberColumn(format="$%.0f"),
-        "Change (%)": st.column_config.NumberColumn(format="%.2f%%"),
-        "Last Updated (UTC)": st.column_config.DatetimeColumn(format="YYYY-MM-DD HH:mm"),
+        "Change (1d USD)": st.column_config.NumberColumn(format="$%.0f"),
+        "Change (1d %)": st.column_config.NumberColumn(format="%.2f%%"),
+        "Last Updated (UTC)": st.column_config.DatetimeColumn(format="YYYY-MM-DD"),
     },
 )
