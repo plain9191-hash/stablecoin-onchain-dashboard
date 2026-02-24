@@ -9,6 +9,7 @@ st.set_page_config(page_title="Stablecoin Onchain Dashboard", page_icon="🪙", 
 
 CHAINS_API_URL = "https://stablecoins.llama.fi/stablecoinchains"
 CHAIN_HISTORY_API = "https://stablecoins.llama.fi/stablecoincharts/{chain}"
+FX_API_URL = "https://api.frankfurter.app/latest?from=USD&to=KRW"
 TARGET_CHAINS = ["Ethereum", "Tron", "BSC", "Solana"]
 DISPLAY_NAME_MAP = {
     "Ethereum": "ETH",
@@ -92,6 +93,16 @@ def load_daily_change(chain_name: str) -> tuple[float | None, float | None, dt.d
     return delta_abs, delta_pct, latest_ts
 
 
+@st.cache_data(ttl=60 * 60)
+def load_usd_krw_rate() -> float | None:
+    response = requests.get(FX_API_URL, timeout=20)
+    response.raise_for_status()
+    payload = response.json()
+    rates = payload.get("rates", {}) if isinstance(payload, dict) else {}
+    krw = rates.get("KRW")
+    return float(krw) if isinstance(krw, (int, float)) else None
+
+
 def fmt_usd(value: float | None) -> str:
     if value is None or pd.isna(value):
         return "-"
@@ -106,6 +117,12 @@ def fmt_usd_full(value: float | None) -> str:
     if value is None or pd.isna(value):
         return "-"
     return f"${value:,.0f}"
+
+
+def fmt_krw_full(value: float | None) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    return f"₩{value:,.0f}"
 
 
 def fmt_pct(value: float | None) -> str:
@@ -147,6 +164,17 @@ view_df["delta_abs_usd"] = changes.apply(lambda x: x[0])
 view_df["delta_pct"] = changes.apply(lambda x: x[1])
 view_df["last_updated"] = changes.apply(lambda x: x[2])
 
+usd_krw_rate = None
+try:
+    usd_krw_rate = load_usd_krw_rate()
+except requests.RequestException:
+    usd_krw_rate = None
+
+if usd_krw_rate is not None:
+    view_df["market_cap_krw"] = view_df["market_cap_usd"] * usd_krw_rate
+else:
+    view_df["market_cap_krw"] = None
+
 col1, col2, col3 = st.columns(3)
 col1.metric("Total Stablecoin Supply", fmt_usd(view_df["market_cap_usd"].sum()))
 col2.metric("Top Chain", view_df.iloc[0]["display_chain"])
@@ -155,6 +183,11 @@ col3.metric(
     "Last Updated (UTC)",
     latest_update.max().strftime("%Y-%m-%d") if not latest_update.empty else "-",
 )
+
+if usd_krw_rate is not None:
+    st.caption(f"FX Rate: 1 USD = {usd_krw_rate:,.2f} KRW")
+else:
+    st.caption("FX Rate: unavailable")
 
 chart_col1, chart_col2 = st.columns(2)
 
@@ -182,11 +215,20 @@ with chart_col2:
 
 st.subheader("Chain Snapshot")
 table_df = view_df[
-    ["display_chain", "market_cap_usd", "dominance_pct", "delta_abs_usd", "delta_pct", "last_updated"]
+    [
+        "display_chain",
+        "market_cap_usd",
+        "market_cap_krw",
+        "dominance_pct",
+        "delta_abs_usd",
+        "delta_pct",
+        "last_updated",
+    ]
 ].rename(
     columns={
         "display_chain": "Chain",
         "market_cap_usd": "Supply (USD)",
+        "market_cap_krw": "Supply (KRW)",
         "dominance_pct": "Dominance (%)",
         "delta_abs_usd": "Change (1d USD)",
         "delta_pct": "Change (1d %)",
@@ -196,6 +238,7 @@ table_df = view_df[
 
 snapshot_df = table_df.copy()
 snapshot_df["Supply (USD)"] = snapshot_df["Supply (USD)"].map(fmt_usd_full)
+snapshot_df["Supply (KRW)"] = snapshot_df["Supply (KRW)"].map(fmt_krw_full)
 snapshot_df["Change (1d USD)"] = snapshot_df["Change (1d USD)"].map(fmt_usd_full)
 snapshot_df["Dominance (%)"] = snapshot_df["Dominance (%)"].map(fmt_pct)
 snapshot_df["Change (1d %)"] = snapshot_df["Change (1d %)"].map(fmt_pct)
