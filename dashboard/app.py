@@ -102,6 +102,18 @@ def fmt_usd(value: float | None) -> str:
     return f"${value:,.0f}"
 
 
+def fmt_usd_full(value: float | None) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    return f"${value:,.0f}"
+
+
+def fmt_pct(value: float | None) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    return f"{value:,.2f}%"
+
+
 st.title("Stablecoin Onchain Dashboard")
 st.caption("Chains: ETH, TRON, BNB (BSC), SOL | Public, no-login dashboard")
 
@@ -182,15 +194,13 @@ table_df = view_df[
     }
 )
 
-st.dataframe(
-    table_df,
-    hide_index=True,
-    use_container_width=True,
-    column_config={
-        "Supply (USD)": st.column_config.NumberColumn(format="$%.0f"),
-        "Dominance (%)": st.column_config.NumberColumn(format="%.2f"),
-        "Change (1d USD)": st.column_config.NumberColumn(format="$%.0f"),
-        "Change (1d %)": st.column_config.NumberColumn(format="%.2f%%"),
-        "Last Updated (UTC)": st.column_config.DatetimeColumn(format="YYYY-MM-DD"),
-    },
+snapshot_df = table_df.copy()
+snapshot_df["Supply (USD)"] = snapshot_df["Supply (USD)"].map(fmt_usd_full)
+snapshot_df["Change (1d USD)"] = snapshot_df["Change (1d USD)"].map(fmt_usd_full)
+snapshot_df["Dominance (%)"] = snapshot_df["Dominance (%)"].map(fmt_pct)
+snapshot_df["Change (1d %)"] = snapshot_df["Change (1d %)"].map(fmt_pct)
+snapshot_df["Last Updated (UTC)"] = snapshot_df["Last Updated (UTC)"].map(
+    lambda d: d.strftime("%Y-%m-%d") if pd.notna(d) else "-"
 )
+
+st.dataframe(snapshot_df, hide_index=True, use_container_width=True)
